@@ -1,0 +1,10 @@
+# 빌드 산출물
+build/
+dist/
+DerivedData/
+
+# xcodegen이 생성 (project.yml에서 재생성 가능)
+TokenBar.xcodeproj/
+
+# macOS
+.DS_Store

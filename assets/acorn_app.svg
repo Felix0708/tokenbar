@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFF6E8"/>
+      <stop offset="1" stop-color="#FFD9A0"/>
+    </linearGradient>
+    <linearGradient id="nut" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6B4423"/>
+      <stop offset="1" stop-color="#432610"/>
+    </linearGradient>
+    <linearGradient id="cap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#E2AF6C"/>
+      <stop offset="1" stop-color="#C08549"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#bg)"/>
+  <ellipse cx="512" cy="884" rx="270" ry="32" fill="#000000" opacity="0.10"/>
+  <g transform="translate(512 540) scale(1.22) rotate(-24) translate(-512 -540)">
+    <path d="M496 196 Q490 248 502 292 L568 284 Q548 238 542 192 Q518 174 496 196 Z" fill="#3A2210"/>
+    <path d="M330 468 Q330 716 512 806 Q694 716 694 468 Z" fill="url(#nut)"/>
+    <path d="M398 500 Q398 660 468 732 Q416 680 408 500 Z" fill="#8A5A2E" opacity="0.6"/>
+    <path d="M512 268 Q304 268 290 496 Q512 556 734 496 Q720 268 512 268 Z" fill="url(#cap)"/>
+    <path d="M290 496 Q512 556 734 496 Q734 524 512 574 Q290 524 290 496 Z" fill="#A96F38"/>
+    <path d="M430 292 Q345 316 322 420 Q336 324 452 288 Z" fill="#F2CC94" opacity="0.9"/>
+  </g>
+</svg>
