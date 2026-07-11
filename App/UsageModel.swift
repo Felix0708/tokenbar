@@ -65,6 +65,11 @@ final class UsageModel: ObservableObject {
             let codex = codexParser.collect()
             let gemini = geminiParser.collect(dailyLimit: geminiLimit)
 
+            if let plan = await oauth.subscriptionLabel() {
+                claude.planLabel = plan
+                claude.planDetected = true
+            }
+
             if let limits = await oauth.fetchLimits() {
                 claude.sessionPercent = limits.fiveHour
                 claude.sessionResetAt = limits.fiveHourReset
@@ -72,11 +77,11 @@ final class UsageModel: ObservableObject {
                 claude.weekResetAt = limits.sevenDayReset
                 claude.extraLimits = limits.extras.isEmpty ? nil : limits.extras
             } else {
-                // 조회 실패(429 등) 시 마지막으로 성공한 값을 유지
-                claude.sessionPercent = prevClaude.sessionPercent
-                claude.sessionResetAt = prevClaude.sessionResetAt
-                claude.weekPercent = prevClaude.weekPercent
-                claude.weekResetAt = prevClaude.weekResetAt
+                // 영구 캐시가 있으면 OAuth 클라이언트가 반환한다. 없으면 0이 아니라 조회 불가로 표시.
+                claude.sessionPercent = nil
+                claude.sessionResetAt = nil
+                claude.weekPercent = nil
+                claude.weekResetAt = nil
                 claude.extraLimits = prevClaude.extraLimits
             }
             claude.weekLabel = "주간"

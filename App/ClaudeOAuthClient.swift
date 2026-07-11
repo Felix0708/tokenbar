@@ -1,13 +1,14 @@
 import Foundation
 import Security
 
-struct ClaudeLimits {
+struct ClaudeLimits: Codable {
     var fiveHour: Double?
     var fiveHourReset: Date?
     var sevenDay: Double?
     var sevenDayReset: Date?
     /// 모델별 주간 창 등 추가 한도 (예: "주간(Sonnet)")
     var extras: [ExtraLimit] = []
+    var fetchedAt: Date? = nil
 }
 
 /// Anthropic OAuth usage API로 남은 한도(5시간/주간/모델별 %)를 조회.
@@ -18,10 +19,19 @@ final class ClaudeOAuthClient {
     private var lastFetch: Date?
     private var backoffUntil: Date?
     private(set) var statusNote: String?
+    private var cachedPlanLabel: String?
 
     private let cacheInterval: TimeInterval = 900
     private let minBackoff: TimeInterval = 1800
+    private let limitsCacheURL = SnapshotStore.supportDir.appendingPathComponent("claude-limits-v1.json")
     private let userAgent = "claude-code/2.1.206"
+
+    init() {
+        if let data = try? Data(contentsOf: limitsCacheURL),
+           let limits = try? JSONDecoder().decode(ClaudeLimits.self, from: data) {
+            cached = limits
+        }
+    }
 
     func fetchLimits() async -> ClaudeLimits? {
         if let last = lastFetch, Date().timeIntervalSince(last) < cacheInterval, cached != nil {
@@ -31,7 +41,7 @@ final class ClaudeOAuthClient {
             return cached
         }
         guard let token = readAccessToken() else {
-            statusNote = "Claude Code 로그인 정보 없음 (키체인 접근 허용 필요)"
+            statusNote = staleNote("Claude Code 로그인 정보 없음 — 터미널에서 claude auth login 실행")
             return cached
         }
 
@@ -52,16 +62,16 @@ final class ClaudeOAuthClient {
                 }
                 backoffUntil = Date().addingTimeInterval(wait)
                 let mins = Int(wait / 60)
-                statusNote = "Anthropic이 조회 차단 중 — \(mins)분 뒤 재시도 (마지막 값 표시)"
+                statusNote = staleNote("Anthropic이 조회 차단 중 — \(mins)분 뒤 재시도")
                 return cached
             }
             if status == 401 || status == 403 {
-                statusNote = "토큰 만료 — 터미널에서 claude 한 번 실행하면 갱신됨"
+                statusNote = staleNote("토큰 만료 — 터미널에서 claude 한 번 실행하면 갱신됨")
                 return cached
             }
             guard status == 200,
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-                statusNote = "한도 API 응답 오류 (\(status))"
+                statusNote = staleNote("한도 API 응답 오류 (\(status))")
                 return cached
             }
 
@@ -87,14 +97,65 @@ final class ClaudeOAuthClient {
                 ))
             }
             limits.extras.sort { $0.label < $1.label }
+            limits.fetchedAt = Date()
             cached = limits
             lastFetch = Date()
+            if let data = try? JSONEncoder().encode(limits) {
+                try? data.write(to: limitsCacheURL, options: .atomic)
+            }
             statusNote = nil
             return limits
         } catch {
-            statusNote = "네트워크 오류"
+            statusNote = staleNote("네트워크 오류")
             return cached
         }
+    }
+
+    /// Claude CLI가 확인한 현재 구독 플랜. 토큰/비밀번호는 읽지 않고 상태 JSON만 사용한다.
+    func subscriptionLabel() async -> String? {
+        if let cachedPlanLabel { return cachedPlanLabel }
+        let candidates = cliCandidates()
+        for path in candidates {
+            guard FileManager.default.isExecutableFile(atPath: path) else { continue }
+            let process = Process()
+            let output = Pipe()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = ["auth", "status", "--json"]
+            process.standardOutput = output
+            process.standardError = Pipe()
+            do {
+                try process.run()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0 else { continue }
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      (obj["loggedIn"] as? Bool) == true,
+                      let raw = obj["subscriptionType"] as? String,
+                      !raw.isEmpty else { continue }
+                let label = raw
+                    .replacingOccurrences(of: "_", with: " ")
+                    .split(separator: " ")
+                    .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+                    .joined(separator: " ")
+                cachedPlanLabel = label
+                return label
+            } catch {
+                continue
+            }
+        }
+        return nil
+    }
+
+    private func cliCandidates() -> [String] {
+        let pathEntries = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map { String($0) }
+        return pathEntries.map { "\($0)/claude" } + [
+            SnapshotStore.realHome.appendingPathComponent(".local/bin/claude").path,
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            "/usr/bin/claude"
+        ]
     }
 
     private func numVal(_ v: Any?) -> Double? {
@@ -137,5 +198,15 @@ final class ClaudeOAuthClient {
               let oauth = obj["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String, !token.isEmpty else { return nil }
         return token
+    }
+
+    private func staleNote(_ reason: String) -> String {
+        guard let fetchedAt = cached?.fetchedAt else {
+            return "\(reason) — 한도 조회 불가"
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM/dd HH:mm"
+        formatter.locale = Locale(identifier: "ko_KR")
+        return "\(reason) — 마지막 성공값 \(formatter.string(from: fetchedAt)) 기준"
     }
 }

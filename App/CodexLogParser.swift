@@ -12,6 +12,7 @@ struct CodexFileAgg: Codable {
     var primaryResetAt: Date?
     var secondaryResetAt: Date?
     var lastTimestamp: Date?
+    var planType: String?
 }
 
 /// ~/.codex/sessions/**/rollout-*.jsonl 을 파싱.
@@ -79,6 +80,10 @@ final class CodexLogParser {
         }
 
         if let l = latestLimits {
+            if let plan = l.planType {
+                usage.planLabel = Self.planLabel(plan)
+                usage.planDetected = true
+            }
             usage.sessionPercent = l.primaryPercent
             usage.weekPercent = l.secondaryPercent
             usage.sessionResetAt = l.primaryResetAt
@@ -93,6 +98,12 @@ final class CodexLogParser {
                 usage.weekPercent = 0
                 usage.weekResetAt = nil
             }
+            if let ts = l.lastTimestamp, Date().timeIntervalSince(ts) > 15 * 60 {
+                let f = DateFormatter()
+                f.dateFormat = "MM/dd HH:mm"
+                f.locale = Locale(identifier: "ko_KR")
+                usage.note = "한도는 마지막 Codex 세션 기록(\(f.string(from: ts))) 기준"
+            }
         }
 
         usage.weekLabel = "주간"
@@ -104,6 +115,13 @@ final class CodexLogParser {
             try? data.write(to: cacheURL, options: .atomic)
         }
         return usage
+    }
+
+    private static func planLabel(_ raw: String) -> String {
+        raw.replacingOccurrences(of: "_", with: " ")
+            .split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+            .joined(separator: " ")
     }
 
     private static func parse(url: URL, mtime: Double, size: Int) -> CodexFileAgg {
@@ -120,7 +138,8 @@ final class CodexLogParser {
 
         var agg = CodexFileAgg(mtime: mtime, size: size, day: day, model: "gpt-5", tokens: 0, cost: 0,
                                primaryPercent: nil, secondaryPercent: nil,
-                               primaryResetAt: nil, secondaryResetAt: nil, lastTimestamp: nil)
+                               primaryResetAt: nil, secondaryResetAt: nil, lastTimestamp: nil,
+                               planType: nil)
         guard let content = try? String(contentsOf: url, encoding: .utf8) else { return agg }
 
         var model = ""
@@ -146,6 +165,9 @@ final class CodexLogParser {
                 lastTotal = total
             }
             if let rl = payload["rate_limits"] as? [String: Any] {
+                if let plan = rl["plan_type"] as? String, !plan.isEmpty {
+                    agg.planType = plan
+                }
                 let base = ts ?? Date()
                 if let p = rl["primary"] as? [String: Any] {
                     agg.primaryPercent = doubleVal(p["used_percent"])

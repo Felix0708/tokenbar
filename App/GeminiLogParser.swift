@@ -13,6 +13,11 @@ struct GeminiFileAgg: Codable {
 /// Gemini는 한도 %를 제공하지 않으므로 "오늘 요청 수 ÷ 플랜 일일 한도"로 추정.
 /// (일일 한도는 태평양 시간 자정에 리셋)
 final class GeminiLogParser {
+    private struct PlanInfo {
+        let label: String
+        let dailyLimit: Int
+    }
+
     private var cache: [String: GeminiFileAgg] = [:]
     private let cacheURL = SnapshotStore.supportDir.appendingPathComponent("cache-gemini-v2.json")
 
@@ -33,6 +38,13 @@ final class GeminiLogParser {
 
     func collect(dailyLimit: Int) -> ProviderUsage {
         var usage = ProviderUsage()
+        let detectedPlan = Self.detectPlan()
+        let effectiveDailyLimit = detectedPlan?.dailyLimit ?? dailyLimit
+        if let detectedPlan {
+            usage.planLabel = detectedPlan.label
+            usage.dailyLimit = detectedPlan.dailyLimit
+            usage.planDetected = true
+        }
         let fm = FileManager.default
         let root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/tmp")
         guard fm.fileExists(atPath: root.path),
@@ -85,17 +97,19 @@ final class GeminiLogParser {
             }
         }
 
+        let hasTodayTokenData = newCache.values.contains { $0.days[today] != nil }
         if newCache.isEmpty {
             usage.note = "Gemini CLI 기록 없음"
+        } else if !hasTodayTokenData {
+            usage.sessionLabel = "일일"
+            usage.sessionResetAt = Self.nextPTReset()
+            usage.note = "오늘 토큰 미집계"
         } else {
             // 일일 한도 사용률 추정 (요청 수 기반)
             usage.sessionLabel = "일일"
-            usage.sessionPercent = min(100, Double(requestsToday) / Double(max(dailyLimit, 1)) * 100)
-            var cal = Calendar(identifier: .gregorian)
-            if let pt = TimeZone(identifier: "America/Los_Angeles") { cal.timeZone = pt }
-            let startOfDay = cal.startOfDay(for: Date())
-            usage.sessionResetAt = cal.date(byAdding: .day, value: 1, to: startOfDay)
-            usage.note = "일일 \(requestsToday)/\(dailyLimit)회 · 요청 수 기반 추정"
+            usage.sessionPercent = min(100, Double(requestsToday) / Double(max(effectiveDailyLimit, 1)) * 100)
+            usage.sessionResetAt = Self.nextPTReset()
+            usage.note = "일일 \(requestsToday)/\(effectiveDailyLimit)회 · 요청 수 기반 추정"
         }
         usage.models = modelAgg.values
             .filter { $0.totalTokens > 0 }
@@ -107,6 +121,57 @@ final class GeminiLogParser {
         return usage
     }
 
+    /// Gemini CLI가 남긴 구조화된 계정/quota 정보가 있을 때만 플랜을 확정한다.
+    /// google_accounts.json의 이메일만으로는 무료/Pro/Ultra를 구분할 수 없다.
+    private static func detectPlan() -> PlanInfo? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let files = [
+            home.appendingPathComponent(".gemini/google_accounts.json"),
+            home.appendingPathComponent(".gemini/settings.json"),
+            home.appendingPathComponent(".gemini/state.json")
+        ]
+        for url in files {
+            guard let data = try? Data(contentsOf: url),
+                  let obj = try? JSONSerialization.jsonObject(with: data) else { continue }
+            if let plan = findPlan(in: obj) { return plan }
+        }
+        return nil
+    }
+
+    private static func findPlan(in value: Any) -> PlanInfo? {
+        if let dict = value as? [String: Any] {
+            for (key, child) in dict {
+                let k = key.lowercased()
+                if k.contains("plan") || k.contains("subscription") || k.contains("tier") {
+                    if let raw = child as? String {
+                        let s = raw.lowercased()
+                        if s.contains("ultra") { return PlanInfo(label: "AI Ultra", dailyLimit: 2000) }
+                        if s.contains("pro") { return PlanInfo(label: "AI Pro", dailyLimit: 1500) }
+                        if s.contains("enterprise") { return PlanInfo(label: "Code Assist Enterprise", dailyLimit: 2000) }
+                        if s.contains("standard") { return PlanInfo(label: "Code Assist Standard", dailyLimit: 1500) }
+                        if s.contains("free") || s.contains("individual") { return PlanInfo(label: "무료", dailyLimit: 1000) }
+                    }
+                }
+                if let number = child as? NSNumber,
+                   (k.contains("daily") || k.contains("request") || k.contains("quota")) {
+                    switch number.intValue {
+                    case 2000: return PlanInfo(label: "AI Ultra", dailyLimit: 2000)
+                    case 1500: return PlanInfo(label: "AI Pro", dailyLimit: 1500)
+                    case 1000: return PlanInfo(label: "무료", dailyLimit: 1000)
+                    case 250: return PlanInfo(label: "무료 API 키", dailyLimit: 250)
+                    default: break
+                    }
+                }
+                if let plan = findPlan(in: child) { return plan }
+            }
+        } else if let array = value as? [Any] {
+            for child in array {
+                if let plan = findPlan(in: child) { return plan }
+            }
+        }
+        return nil
+    }
+
     private static func parse(url: URL, mtime: Double, size: Int) -> GeminiFileAgg {
         var days: [String: [String: DayAgg]] = [:]
         var reqsPT: [String: Int] = [:]
@@ -114,12 +179,16 @@ final class GeminiLogParser {
             return GeminiFileAgg(mtime: mtime, size: size, days: [:], reqsPT: [:])
         }
 
-        // 메시지 목록 추출 (json / jsonl 모두 지원, 포맷 변화에 방어적으로)
+        // 메시지 목록 추출 (구형 messages/history와 현재 $set.messages 모두 지원)
         var messages: [[String: Any]] = []
         if url.pathExtension == "jsonl" {
             if let content = String(data: data, encoding: .utf8) {
                 for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
-                    if let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] {
+                    guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
+                    if let patch = obj["$set"] as? [String: Any],
+                       let nested = patch["messages"] as? [[String: Any]] {
+                        messages.append(contentsOf: nested)
+                    } else {
                         messages.append(obj)
                     }
                 }
@@ -138,11 +207,21 @@ final class GeminiLogParser {
             }
         }
 
+        var uniqueMessages: [[String: Any]] = []
+        var seen = Set<String>()
+        for msg in messages {
+            let id = (msg["id"] as? String) ?? ""
+            let timestamp = (msg["timestamp"] as? String) ?? ""
+            let type = (msg["type"] as? String) ?? ""
+            let key = id.isEmpty ? "\(timestamp)|\(type)|\(msg["model"] as? String ?? "")" : id
+            if seen.insert(key).inserted { uniqueMessages.append(msg) }
+        }
+
         let fileDate = Date(timeIntervalSince1970: mtime > 0 ? mtime : Date().timeIntervalSince1970)
         let fallbackDay = ClaudeLogParser.dayFormatter.string(from: fileDate)
         let fallbackDayPT = ptDayFormatter.string(from: fileDate)
 
-        for msg in messages {
+        for msg in uniqueMessages {
             guard let tokens = msg["tokens"] as? [String: Any] else { continue }
             let input = ClaudeLogParser.intVal(tokens["input"])
             let output = ClaudeLogParser.intVal(tokens["output"])
@@ -174,5 +253,12 @@ final class GeminiLogParser {
             reqsPT[dayPT, default: 0] += 1
         }
         return GeminiFileAgg(mtime: mtime, size: size, days: days, reqsPT: reqsPT)
+    }
+
+    private static func nextPTReset() -> Date {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        let startOfDay = cal.startOfDay(for: Date())
+        return cal.date(byAdding: .day, value: 1, to: startOfDay)!
     }
 }

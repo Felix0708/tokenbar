@@ -34,6 +34,12 @@ struct ProviderUsage: Codable {
     var sessionLabel: String? = nil
     var weekLabel: String? = nil
     var note: String? = nil
+    /// 로그인/세션 기록에서 확인된 구독 플랜 (예: "Pro", "Plus", "AI Pro")
+    var planLabel: String? = nil
+    /// Gemini처럼 일일 요청 한도가 있는 경우 자동 감지된 한도
+    var dailyLimit: Int? = nil
+    /// 플랜 정보를 실제 계정/세션 데이터에서 확인했는지 여부
+    var planDetected: Bool? = nil
     /// 모델별 분해 (사용량 많은 순)
     var models: [ModelUsage]? = nil
     /// 추가 한도 창 (모델별 주간 등)

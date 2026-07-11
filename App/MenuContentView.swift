@@ -1,5 +1,6 @@
 import SwiftUI
 import ServiceManagement
+import AppKit
 
 struct MenuContentView: View {
     @ObservedObject var model: UsageModel
@@ -7,15 +8,15 @@ struct MenuContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if model.showClaude {
-                ProviderSection(name: "Claude", tint: .orange, usage: model.snapshot.claude)
+                ProviderSection(name: "Claude", tint: .orange, usage: model.snapshot.claude, onClaudeLogin: model.refresh)
                 Divider()
             }
             if model.showCodex {
-                ProviderSection(name: "Codex", tint: .teal, usage: model.snapshot.codex)
+                ProviderSection(name: "Codex", tint: .teal, usage: model.snapshot.codex, onClaudeLogin: {})
                 Divider()
             }
             if model.showGemini {
-                ProviderSection(name: "Gemini", tint: .blue, usage: model.snapshot.gemini ?? ProviderUsage())
+                ProviderSection(name: "Gemini", tint: .blue, usage: model.snapshot.gemini ?? ProviderUsage(), onClaudeLogin: {})
                 Divider()
             }
 
@@ -30,8 +31,19 @@ struct MenuContentView: View {
                 Spacer()
             }
 
-            // Gemini 일일 한도 플랜 선택
-            if model.showGemini {
+            // Gemini 플랜이 실제 quota 정보로 확인되면 하나만 표시하고, 아니면 수동 한도를 제공
+            if model.showGemini, let gemini = model.snapshot.gemini,
+               gemini.planDetected == true, let plan = gemini.planLabel {
+                HStack(spacing: 6) {
+                    Text("Gemini 플랜")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(plan + (gemini.dailyLimit.map { " · \($0)/일" } ?? ""))
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                    Spacer()
+                }
+            } else if model.showGemini {
                 HStack(spacing: 6) {
                     Text("Gemini 일일 한도")
                         .font(.caption2)
@@ -87,6 +99,7 @@ struct ProviderSection: View {
     let name: String
     let tint: Color
     let usage: ProviderUsage
+    let onClaudeLogin: () -> Void
     @State private var showModels = false
 
     var body: some View {
@@ -94,6 +107,14 @@ struct ProviderSection: View {
             HStack {
                 Circle().fill(tint).frame(width: 8, height: 8)
                 Text(name).font(.headline)
+                if let plan = usage.planLabel {
+                    Text(plan)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(tint)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(tint.opacity(0.12), in: Capsule())
+                }
                 Spacer()
                 Text("오늘 \(Fmt.exact(usage.todayTokens)) 토큰 · \(Fmt.cost(usage.todayCost))")
                     .font(.caption)
@@ -133,7 +154,7 @@ struct ProviderSection: View {
                     HStack(spacing: 4) {
                         Image(systemName: showModels ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8))
-                        Text("모델별 보기")
+                        Text("모델별 보기 (\(models.count))")
                             .font(.caption2)
                     }
                     .foregroundStyle(.secondary)
@@ -141,27 +162,46 @@ struct ProviderSection: View {
                 .buttonStyle(.plain)
 
                 if showModels {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(Array(models.prefix(5))) { m in
-                            HStack {
-                                Text(m.name)
-                                    .font(.caption2)
-                                    .lineLimit(1)
-                                Spacer()
-                                Text("오늘 \(Fmt.tokens(m.todayTokens)) · 누적 \(Fmt.tokens(m.totalTokens)) · \(Fmt.cost(m.totalCost))")
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(models) { m in
+                                HStack {
+                                    Text(m.name)
+                                        .font(.caption2)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text("오늘 \(Fmt.tokens(m.todayTokens)) · 누적 \(Fmt.tokens(m.totalTokens)) · \(Fmt.cost(m.totalCost))")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
+                        .padding(.trailing, 2)
                     }
+                    .frame(height: min(max(CGFloat(models.count) * 18, 18), 180))
                     .padding(.leading, 12)
                 }
             }
 
             if let note = usage.note {
-                Text(note)
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
+                HStack(spacing: 6) {
+                    Text(note)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if name == "Claude", note.contains("claude auth login") {
+                        Button("로그인") {
+                            ClaudeLoginLauncher.open()
+                            Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                                onClaudeLogin()
+                            }
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
+                    }
+                }
             }
         }
     }
@@ -176,6 +216,29 @@ struct ProviderSection: View {
             parts.append("\(u.weekLabel ?? "주간") \(r)")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+}
+
+enum ClaudeLoginLauncher {
+    static func open() {
+        let command = "claude auth login"
+        let source = """
+        tell application "Terminal"
+            activate
+            do script "\(command)"
+        end tell
+        """
+
+        var error: NSDictionary?
+        if let script = NSAppleScript(source: source) {
+            script.executeAndReturnError(&error)
+            if error == nil { return }
+        }
+
+        // Terminal 자동 제어가 막힌 경우에도 한 번의 붙여넣기로 진행할 수 있게 함.
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
     }
 }
 
