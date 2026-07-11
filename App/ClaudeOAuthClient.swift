@@ -6,19 +6,22 @@ struct ClaudeLimits {
     var fiveHourReset: Date?
     var sevenDay: Double?
     var sevenDayReset: Date?
+    /// 모델별 주간 창 등 추가 한도 (예: "주간(Sonnet)")
+    var extras: [ExtraLimit] = []
 }
 
-/// Anthropic OAuth usage API로 남은 한도(5시간/주간 %)를 조회.
+/// Anthropic OAuth usage API로 남은 한도(5시간/주간/모델별 %)를 조회.
 /// 토큰은 macOS 키체인("Claude Code-credentials") 또는 ~/.claude/.credentials.json 에서 읽음.
-/// 응답은 5분 캐시, 429 발생 시 15분 백오프.
+/// 응답은 15분 캐시, 429 발생 시 Retry-After(최소 30분) 백오프.
 final class ClaudeOAuthClient {
     private var cached: ClaudeLimits?
     private var lastFetch: Date?
     private var backoffUntil: Date?
     private(set) var statusNote: String?
 
-    private let cacheInterval: TimeInterval = 300
-    private let backoffInterval: TimeInterval = 900
+    private let cacheInterval: TimeInterval = 900
+    private let minBackoff: TimeInterval = 1800
+    private let userAgent = "claude-code/2.1.206"
 
     func fetchLimits() async -> ClaudeLimits? {
         if let last = lastFetch, Date().timeIntervalSince(last) < cacheInterval, cached != nil {
@@ -35,19 +38,25 @@ final class ClaudeOAuthClient {
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 15
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let http = response as? HTTPURLResponse
+            let status = http?.statusCode ?? 0
             if status == 429 {
-                backoffUntil = Date().addingTimeInterval(backoffInterval)
-                statusNote = "한도 API 요청 제한 — 잠시 후 재시도"
+                var wait = minBackoff
+                if let ra = http?.value(forHTTPHeaderField: "Retry-After"), let s = Double(ra), s > 0 {
+                    wait = max(s, minBackoff)
+                }
+                backoffUntil = Date().addingTimeInterval(wait)
+                let mins = Int(wait / 60)
+                statusNote = "Anthropic이 조회 차단 중 — \(mins)분 뒤 재시도 (마지막 값 표시)"
                 return cached
             }
             if status == 401 || status == 403 {
-                statusNote = "토큰 만료 — Claude Code를 한 번 실행하면 갱신됨"
+                statusNote = "토큰 만료 — 터미널에서 claude 한 번 실행하면 갱신됨"
                 return cached
             }
             guard status == 200,
@@ -65,6 +74,19 @@ final class ClaudeOAuthClient {
                 limits.sevenDay = numVal(seven["utilization"])
                 limits.sevenDayReset = dateVal(seven["resets_at"])
             }
+            // 모델별 주간 창: "seven_day_sonnet", "seven_day_opus" 등
+            for (key, value) in obj {
+                guard key.hasPrefix("seven_day_"),
+                      let dict = value as? [String: Any],
+                      let pct = numVal(dict["utilization"]) else { continue }
+                let model = String(key.dropFirst("seven_day_".count)).capitalized
+                limits.extras.append(ExtraLimit(
+                    label: "주간(\(model))",
+                    percent: pct,
+                    resetAt: dateVal(dict["resets_at"])
+                ))
+            }
+            limits.extras.sort { $0.label < $1.label }
             cached = limits
             lastFetch = Date()
             statusNote = nil

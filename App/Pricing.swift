@@ -22,6 +22,13 @@ enum Pricing {
         if m.contains("sonnet") || m.contains("fable") || m.contains("claude") {
             return ModelPrice(input: 3, cacheWrite: 3.75, cacheRead: 0.3, output: 15)
         }
+        // Google
+        if m.contains("gemini") {
+            if m.contains("pro") {
+                return ModelPrice(input: 1.25, cacheWrite: 0, cacheRead: 0.31, output: 10)
+            }
+            return ModelPrice(input: 0.30, cacheWrite: 0, cacheRead: 0.075, output: 2.5)
+        }
         // OpenAI
         if m.contains("gpt-5") || m.contains("codex") || m.contains("o3") || m.contains("o4") {
             return ModelPrice(input: 1.25, cacheWrite: 0, cacheRead: 0.125, output: 10)

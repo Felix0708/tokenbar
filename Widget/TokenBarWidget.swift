@@ -1,6 +1,13 @@
 import WidgetKit
 import SwiftUI
 
+struct ProviderItem: Identifiable {
+    let name: String
+    let tint: Color
+    let usage: ProviderUsage
+    var id: String { name }
+}
+
 struct TokenEntry: TimelineEntry {
     let date: Date
     let snapshot: UsageSnapshot
@@ -37,24 +44,42 @@ struct TokenProvider: TimelineProvider {
     }
 }
 
+func visibleProviders(_ s: UsageSnapshot) -> [ProviderItem] {
+    let en = s.enabled ?? [:]
+    var out: [ProviderItem] = []
+    if en["claude"] ?? true {
+        out.append(ProviderItem(name: "Claude", tint: .orange, usage: s.claude))
+    }
+    if en["codex"] ?? true {
+        out.append(ProviderItem(name: "Codex", tint: .teal, usage: s.codex))
+    }
+    if en["gemini"] ?? true, let g = s.gemini, g.totalTokens > 0 {
+        out.append(ProviderItem(name: "Gemini", tint: .blue, usage: g))
+    }
+    return out
+}
+
 struct TokenBarWidgetView: View {
     @Environment(\.widgetFamily) var family
     let entry: TokenEntry
 
     var body: some View {
+        let providers = visibleProviders(entry.snapshot)
         Group {
             if family == .systemSmall {
-                VStack(alignment: .leading, spacing: 8) {
-                    CompactRow(name: "Claude", tint: .orange, usage: entry.snapshot.claude)
-                    Divider()
-                    CompactRow(name: "Codex", tint: .teal, usage: entry.snapshot.codex)
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(providers) { p in
+                        CompactRow(item: p)
+                        if p.id != providers.last?.id { Divider() }
+                    }
                 }
             } else {
                 VStack(alignment: .leading, spacing: 6) {
-                    HStack(alignment: .top, spacing: 14) {
-                        DetailColumn(name: "Claude", tint: .orange, usage: entry.snapshot.claude)
-                        Divider()
-                        DetailColumn(name: "Codex", tint: .teal, usage: entry.snapshot.codex)
+                    HStack(alignment: .top, spacing: 12) {
+                        ForEach(providers) { p in
+                            DetailColumn(item: p)
+                            if p.id != providers.last?.id { Divider() }
+                        }
                     }
                     HStack {
                         Spacer()
@@ -71,24 +96,22 @@ struct TokenBarWidgetView: View {
 
 /// 소형 위젯: 5시간 바 + 오늘 사용량
 struct CompactRow: View {
-    let name: String
-    let tint: Color
-    let usage: ProviderUsage
+    let item: ProviderItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             HStack {
-                Circle().fill(tint).frame(width: 7, height: 7)
-                Text(name).font(.caption.bold())
+                Circle().fill(item.tint).frame(width: 7, height: 7)
+                Text(item.name).font(.caption.bold())
                 Spacer()
-                Text(Fmt.percent(usage.sessionPercent))
+                Text(Fmt.percent(item.usage.sessionPercent))
                     .font(.caption.monospacedDigit().bold())
-                    .foregroundStyle(WidgetColor.of(usage.sessionPercent, tint: tint))
+                    .foregroundStyle(WidgetColor.of(item.usage.sessionPercent, tint: item.tint))
             }
-            ProgressView(value: min(max(usage.sessionPercent ?? 0, 0), 100), total: 100)
-                .tint(WidgetColor.of(usage.sessionPercent, tint: tint))
+            ProgressView(value: min(max(item.usage.sessionPercent ?? 0, 0), 100), total: 100)
+                .tint(WidgetColor.of(item.usage.sessionPercent, tint: item.tint))
                 .scaleEffect(x: 1, y: 0.7, anchor: .center)
-            Text("오늘 \(Fmt.tokens(usage.todayTokens))")
+            Text("오늘 \(Fmt.tokens(item.usage.todayTokens))")
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
         }
@@ -97,23 +120,23 @@ struct CompactRow: View {
 
 /// 중형 위젯: 5시간·주간 바 + 오늘/누적 토큰·비용
 struct DetailColumn: View {
-    let name: String
-    let tint: Color
-    let usage: ProviderUsage
+    let item: ProviderItem
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Circle().fill(tint).frame(width: 7, height: 7)
-                Text(name).font(.caption.bold())
+                Circle().fill(item.tint).frame(width: 7, height: 7)
+                Text(item.name).font(.caption.bold())
                 Spacer()
             }
-            barRow("5시간", usage.sessionPercent)
-            barRow("주간", usage.weekPercent)
+            barRow(item.usage.sessionLabel ?? "5시간", item.usage.sessionPercent)
+            if item.usage.weekLabel != nil || item.usage.weekPercent != nil {
+                barRow(item.usage.weekLabel ?? "주간", item.usage.weekPercent)
+            }
             Group {
-                Text("오늘 \(Fmt.exact(usage.todayTokens)) · \(Fmt.cost(usage.todayCost))")
-                Text("누적 \(Fmt.exact(usage.totalTokens))")
-                Text("누적 \(Fmt.cost(usage.totalCost)) (추정)")
+                Text("오늘 \(Fmt.exact(item.usage.todayTokens)) · \(Fmt.cost(item.usage.todayCost))")
+                Text("누적 \(Fmt.exact(item.usage.totalTokens))")
+                Text("누적 \(Fmt.cost(item.usage.totalCost)) (추정)")
             }
             .font(.system(size: 9).monospacedDigit())
             .foregroundStyle(.secondary)
@@ -130,11 +153,11 @@ struct DetailColumn: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 26, alignment: .leading)
             ProgressView(value: min(max(percent ?? 0, 0), 100), total: 100)
-                .tint(WidgetColor.of(percent, tint: tint))
+                .tint(WidgetColor.of(percent, tint: item.tint))
                 .scaleEffect(x: 1, y: 0.6, anchor: .center)
             Text(Fmt.percent(percent))
                 .font(.system(size: 9).monospacedDigit().bold())
-                .foregroundStyle(WidgetColor.of(percent, tint: tint))
+                .foregroundStyle(WidgetColor.of(percent, tint: item.tint))
                 .frame(width: 30, alignment: .trailing)
         }
     }
@@ -154,7 +177,7 @@ struct TokenBarWidget: Widget {
         StaticConfiguration(kind: "TokenBarWidget", provider: TokenProvider()) { entry in
             TokenBarWidgetView(entry: entry)
         }
-        .configurationDisplayName("Claude · Codex 토큰")
+        .configurationDisplayName("Claude · Codex · Gemini 토큰")
         .description("남은 사용 한도와 오늘 사용량을 보여줍니다.")
         .supportedFamilies([.systemSmall, .systemMedium])
     }

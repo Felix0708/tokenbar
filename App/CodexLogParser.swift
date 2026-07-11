@@ -4,6 +4,7 @@ struct CodexFileAgg: Codable {
     var mtime: Double
     var size: Int
     var day: String
+    var model: String
     var tokens: Int
     var cost: Double
     var primaryPercent: Double?
@@ -17,7 +18,7 @@ struct CodexFileAgg: Codable {
 /// token_count 이벤트의 total_token_usage(누적치)와 rate_limits(사용률 %)를 읽음.
 final class CodexLogParser {
     private var cache: [String: CodexFileAgg] = [:]
-    private let cacheURL = SnapshotStore.supportDir.appendingPathComponent("cache-codex.json")
+    private let cacheURL = SnapshotStore.supportDir.appendingPathComponent("cache-codex-v2.json")
 
     init() {
         if let data = try? Data(contentsOf: cacheURL),
@@ -37,6 +38,7 @@ final class CodexLogParser {
         }
 
         var newCache: [String: CodexFileAgg] = [:]
+        var modelAgg: [String: ModelUsage] = [:]
         let today = ClaudeLogParser.dayFormatter.string(from: Date())
         var latestLimits: CodexFileAgg? = nil
 
@@ -56,10 +58,17 @@ final class CodexLogParser {
 
             usage.totalTokens += agg.tokens
             usage.totalCost += agg.cost
+            var m = modelAgg[agg.model] ?? ModelUsage(name: agg.model)
+            m.totalTokens += agg.tokens
+            m.totalCost += agg.cost
             if agg.day == today {
                 usage.todayTokens += agg.tokens
                 usage.todayCost += agg.cost
+                m.todayTokens += agg.tokens
+                m.todayCost += agg.cost
             }
+            if agg.tokens > 0 { modelAgg[agg.model] = m }
+
             if agg.primaryPercent != nil || agg.secondaryPercent != nil {
                 if let ts = agg.lastTimestamp {
                     if latestLimits == nil || (latestLimits?.lastTimestamp ?? .distantPast) < ts {
@@ -74,12 +83,22 @@ final class CodexLogParser {
             usage.weekPercent = l.secondaryPercent
             usage.sessionResetAt = l.primaryResetAt
             usage.weekResetAt = l.secondaryResetAt
-            // 오래된 정보면 표시하지 않음 (마지막 세션이 6시간 이상 전이면 5시간 창은 이미 리셋됨)
-            if let ts = l.lastTimestamp, Date().timeIntervalSince(ts) > 6 * 3600 {
+            // 기록 당시의 리셋 시각이 이미 지났으면 해당 창은 0으로 처리
+            if let reset = l.primaryResetAt {
+                if Date() > reset { usage.sessionPercent = 0; usage.sessionResetAt = nil }
+            } else if let ts = l.lastTimestamp, Date().timeIntervalSince(ts) > 6 * 3600 {
                 usage.sessionPercent = 0
-                usage.sessionResetAt = nil
+            }
+            if let reset = l.secondaryResetAt, Date() > reset {
+                usage.weekPercent = 0
+                usage.weekResetAt = nil
             }
         }
+
+        usage.weekLabel = "주간"
+        usage.models = modelAgg.values
+            .filter { $0.totalTokens > 0 }
+            .sorted { $0.totalTokens > $1.totalTokens }
         cache = newCache
         if let data = try? JSONEncoder().encode(newCache) {
             try? data.write(to: cacheURL, options: .atomic)
@@ -99,7 +118,7 @@ final class CodexLogParser {
             }
         }
 
-        var agg = CodexFileAgg(mtime: mtime, size: size, day: day, tokens: 0, cost: 0,
+        var agg = CodexFileAgg(mtime: mtime, size: size, day: day, model: "gpt-5", tokens: 0, cost: 0,
                                primaryPercent: nil, secondaryPercent: nil,
                                primaryResetAt: nil, secondaryResetAt: nil, lastTimestamp: nil)
         guard let content = try? String(contentsOf: url, encoding: .utf8) else { return agg }
@@ -114,7 +133,7 @@ final class CodexLogParser {
             guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
                   let payload = obj["payload"] as? [String: Any] else { continue }
 
-            if model.isEmpty, let m = payload["model"] as? String {
+            if let m = payload["model"] as? String, !m.isEmpty {
                 model = m
             }
             guard (payload["type"] as? String) == "token_count" else { continue }
@@ -138,6 +157,8 @@ final class CodexLogParser {
                 }
             }
         }
+
+        agg.model = ClaudeLogParser.shortModel(model.isEmpty ? "gpt-5" : model)
 
         if let total = lastTotal {
             let input = ClaudeLogParser.intVal(total["input_tokens"])

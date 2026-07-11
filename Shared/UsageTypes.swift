@@ -1,6 +1,24 @@
 import Foundation
 
-/// 한 공급자(Claude 또는 Codex)의 사용량 요약
+/// 모델 하나의 사용량 (예: opus-4-8, gpt-5.1-codex, gemini-2.5-pro)
+struct ModelUsage: Codable, Identifiable {
+    var name: String
+    var todayTokens: Int = 0
+    var totalTokens: Int = 0
+    var todayCost: Double = 0
+    var totalCost: Double = 0
+    var id: String { name }
+}
+
+/// 추가 한도 창 (예: Claude 모델별 주간 한도)
+struct ExtraLimit: Codable, Identifiable {
+    var label: String
+    var percent: Double?
+    var resetAt: Date?
+    var id: String { label }
+}
+
+/// 한 공급자(Claude / Codex / Gemini)의 사용량 요약
 struct ProviderUsage: Codable {
     var todayTokens: Int = 0
     var totalTokens: Int = 0
@@ -12,13 +30,23 @@ struct ProviderUsage: Codable {
     var weekPercent: Double? = nil
     var sessionResetAt: Date? = nil
     var weekResetAt: Date? = nil
+    /// 바 라벨 (기본: "5시간" / "주간"; Gemini는 "일일")
+    var sessionLabel: String? = nil
+    var weekLabel: String? = nil
     var note: String? = nil
+    /// 모델별 분해 (사용량 많은 순)
+    var models: [ModelUsage]? = nil
+    /// 추가 한도 창 (모델별 주간 등)
+    var extraLimits: [ExtraLimit]? = nil
 }
 
 struct UsageSnapshot: Codable {
     var updatedAt: Date = Date()
     var claude: ProviderUsage = ProviderUsage()
     var codex: ProviderUsage = ProviderUsage()
+    var gemini: ProviderUsage? = nil
+    /// 위젯에 표시할 공급자 ("claude"/"codex"/"gemini" → true/false)
+    var enabled: [String: Bool]? = nil
 }
 
 /// 앱과 위젯이 공유하는 스냅샷 저장소 (~/Library/Application Support/TokenBar/)
@@ -80,6 +108,18 @@ enum Fmt {
     static func percent(_ p: Double?) -> String {
         guard let p = p else { return "–" }
         return String(format: "%.0f%%", p)
+    }
+
+    /// 리셋까지 남은 시간 (예: "46분 뒤", "3시간 12분 뒤", "3일 뒤")
+    static func rel(_ d: Date?) -> String? {
+        guard let d = d else { return nil }
+        let s = d.timeIntervalSinceNow
+        if s <= 0 { return "곧 리셋" }
+        let m = Int(s / 60)
+        if m < 60 { return "\(m)분 뒤 리셋" }
+        let h = m / 60
+        if h < 48 { return "\(h)시간 \(m % 60)분 뒤 리셋" }
+        return "\(h / 24)일 뒤 리셋"
     }
 
     static func resetTime(_ d: Date?) -> String {
