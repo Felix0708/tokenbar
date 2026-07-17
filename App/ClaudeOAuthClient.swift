@@ -40,7 +40,7 @@ final class ClaudeOAuthClient {
         if let until = backoffUntil, Date() < until {
             return cached
         }
-        guard let token = readAccessToken() else {
+        guard let token = await currentToken() else {
             statusNote = staleNote("Claude Code 로그인 정보 없음 — 터미널에서 claude auth login 실행")
             return cached
         }
@@ -66,6 +66,8 @@ final class ClaudeOAuthClient {
                 return cached
             }
             if status == 401 || status == 403 {
+                // 저장된 토큰이 무효 — 폐기하고 다음 주기에 키체인에서 다시 읽음
+                try? FileManager.default.removeItem(at: tokenFileURL)
                 statusNote = staleNote("토큰 만료 — 터미널에서 claude 한 번 실행하면 갱신됨")
                 return cached
             }
@@ -170,7 +172,99 @@ final class ClaudeOAuthClient {
         return nil
     }
 
-    private func readAccessToken() -> String? {
+    // MARK: - 토큰 관리
+    // 키체인은 처음 한 번만 읽고, 이후에는 TokenBar가 자체 저장·자동 갱신.
+    // → 재빌드해도 키체인 허용 창이 다시 뜨지 않음.
+
+    private struct StoredToken: Codable {
+        var accessToken: String
+        var refreshToken: String?
+        /// epoch (초 또는 밀리초)
+        var expiresAt: Double?
+    }
+
+    private var tokenFileURL: URL {
+        SnapshotStore.supportDir.appendingPathComponent("claude-token.json")
+    }
+
+    private func currentToken() async -> String? {
+        // 1) 자체 저장 토큰
+        if let stored = loadStored() {
+            if !isExpired(stored) {
+                return stored.accessToken
+            }
+            // 만료 → 자동 갱신 시도
+            if let refreshed = await refreshToken(stored) {
+                return refreshed.accessToken
+            }
+        }
+        // 2) 키체인 / 파일에서 읽기 (이때만 허용 창이 뜰 수 있음)
+        if let creds = readClaudeCodeCredentials() {
+            saveStored(creds)
+            return creds.accessToken
+        }
+        return nil
+    }
+
+    private func isExpired(_ t: StoredToken) -> Bool {
+        guard let exp = t.expiresAt else { return false }
+        let expSec = exp > 1e12 ? exp / 1000 : exp  // 밀리초/초 모두 처리
+        return Date().timeIntervalSince1970 > expSec - 300
+    }
+
+    private func refreshToken(_ t: StoredToken) async -> StoredToken? {
+        guard let rt = t.refreshToken, !rt.isEmpty else { return nil }
+        let clientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  // Claude Code 공개 클라이언트 ID
+        let endpoints = [
+            "https://platform.claude.com/v1/oauth/token",
+            "https://console.anthropic.com/v1/oauth/token"
+        ]
+        for endpoint in endpoints {
+            guard let url = URL(string: endpoint) else { continue }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            req.timeoutInterval = 15
+            let body: [String: Any] = [
+                "grant_type": "refresh_token",
+                "refresh_token": rt,
+                "client_id": clientId
+            ]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let at = obj["access_token"] as? String, !at.isEmpty else { continue }
+            var stored = StoredToken(
+                accessToken: at,
+                refreshToken: (obj["refresh_token"] as? String) ?? rt,
+                expiresAt: nil
+            )
+            if let ei = obj["expires_in"] as? Double {
+                stored.expiresAt = Date().timeIntervalSince1970 + ei
+            }
+            saveStored(stored)
+            return stored
+        }
+        return nil
+    }
+
+    private func loadStored() -> StoredToken? {
+        guard let data = try? Data(contentsOf: tokenFileURL) else { return nil }
+        return try? JSONDecoder().decode(StoredToken.self, from: data)
+    }
+
+    private func saveStored(_ t: StoredToken) {
+        if let data = try? JSONEncoder().encode(t) {
+            try? data.write(to: tokenFileURL, options: .atomic)
+            // 소유자만 읽기/쓰기
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: tokenFileURL.path)
+        }
+    }
+
+    private func readClaudeCodeCredentials() -> StoredToken? {
         // 1) 키체인
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -181,23 +275,27 @@ final class ClaudeOAuthClient {
         var result: CFTypeRef?
         if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
            let data = result as? Data,
-           let token = extractToken(from: data) {
-            return token
+           let creds = extractCredentials(from: data) {
+            return creds
         }
         // 2) 파일 폴백
         let url = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/.credentials.json")
-        if let data = try? Data(contentsOf: url), let token = extractToken(from: data) {
-            return token
+        if let data = try? Data(contentsOf: url), let creds = extractCredentials(from: data) {
+            return creds
         }
         return nil
     }
 
-    private func extractToken(from data: Data) -> String? {
+    private func extractCredentials(from data: Data) -> StoredToken? {
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let oauth = obj["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String, !token.isEmpty else { return nil }
-        return token
+        return StoredToken(
+            accessToken: token,
+            refreshToken: oauth["refreshToken"] as? String,
+            expiresAt: (oauth["expiresAt"] as? Double) ?? (oauth["expiresAt"] as? Int).map(Double.init)
+        )
     }
 
     private func staleNote(_ reason: String) -> String {
